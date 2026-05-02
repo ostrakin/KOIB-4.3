@@ -22,7 +22,7 @@ from config import (
     QUERY_PREFIX, PASSAGE_PREFIX,
     VECTOR_SEARCH_K, BM25_SEARCH_K, FINAL_TOP_K,
     HYBRID_ALPHA, USE_RERANKER, RERANKER_MODEL,
-    USE_HYDE, HYDE_CACHE_FILE, get_device,
+    USE_HYDE, HYDE_CACHE_FILE, EMBEDDING_PROVIDER, get_device,
 )
 
 logger = logging.getLogger("koib.retrieval")
@@ -264,7 +264,11 @@ class HybridRetriever:
     ) -> List[RetrievalResult]:
         """Векторный поиск по обоим индексам."""
         results: List[RetrievalResult] = []
-        query_text = QUERY_PREFIX + query
+        # Префиксы нужны только для instruction-tuned моделей (E5, BGE), но не для OpenAI
+        if EMBEDDING_PROVIDER == "local":
+            query_text = QUERY_PREFIX + query
+        else:
+            query_text = query
 
         # Текстовый индекс
         if self.index_builder.text_vectorstore and intent["text"] > 0:
@@ -274,8 +278,11 @@ class HybridRetriever:
                     query_text, k=k_text
                 )
                 for doc, score in docs:
-                    if model_filter and doc.metadata.get("model") != model_filter:
-                        continue
+                    # Исключаем чанки только если модель явно указана И чанк имеет другую модель
+                        # Чанки с model="unknown" НЕ исключаем, чтобы не терять релевантный контент
+                        doc_model = doc.metadata.get("model", "unknown")
+                        if model_filter and doc_model != "unknown" and doc_model != model_filter:
+                            continue
                     results.append(RetrievalResult(
                         chunk_id=doc.metadata.get("chunk_id", ""),
                         content=doc.page_content,
@@ -298,8 +305,11 @@ class HybridRetriever:
                     query_text, k=k_struct
                 )
                 for doc, score in docs:
-                    if model_filter and doc.metadata.get("model") != model_filter:
-                        continue
+                    # Исключаем чанки только если модель явно указана И чанк имеет другую модель
+                        # Чанки с model="unknown" НЕ исключаем, чтобы не терять релевантный контент
+                        doc_model = doc.metadata.get("model", "unknown")
+                        if model_filter and doc_model != "unknown" and doc_model != model_filter:
+                            continue
                     results.append(RetrievalResult(
                         chunk_id=doc.metadata.get("chunk_id", ""),
                         content=doc.page_content,
@@ -326,7 +336,10 @@ class HybridRetriever:
         try:
             bm25_results = self.index_builder.bm25.search(query, k=BM25_SEARCH_K)
             for meta, score in bm25_results:
-                if model_filter and meta.get("model") != model_filter:
+                # Исключаем чанки только если модель явно указана И чанк имеет другую модель
+                # Чанки с model="unknown" НЕ исключаем, чтобы не терять релевантный контент
+                doc_model = meta.get("model", "unknown")
+                if model_filter and doc_model != "unknown" and doc_model != model_filter:
                     continue
                 results.append(RetrievalResult(
                     chunk_id=meta.get("chunk_id", ""),

@@ -8,6 +8,7 @@ Koib-V-4.2 — Общие утилиты
 
 import os
 import re
+import uuid
 import hashlib
 import logging
 from pathlib import Path
@@ -68,8 +69,14 @@ def clean_text(text: str) -> str:
         return ""
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
-    # Оставляем кириллицу, латиницу, цифры, базовую пунктуацию
-    text = re.sub(r'[^\x20-\x7E\u0400-\u04FF\u2116\n\r\t]', '', text)
+    # Оставляем кириллицу, латиницу, цифры, базовую пунктуацию и математические символы
+    # Сохраняем: Unicode-буквы, цифры, пунктуацию и мат. символы (≥ ≤ ≈ ± × ÷ → ∈ ∑ и др.)
+    text = re.sub(
+        r'[^\w\s\-\+\=\*\/\(\)\[\]\{\}\$\<\>\,\.\;\:\!\?\%\&\|\^\~\`\"\'\\\@\#\№\°\±\≥\≤\≈\×\÷\→\∈\∑\…\u0400-\u04FF\u2116\n\r\t]',
+        '',
+        text,
+        flags=re.UNICODE
+    )
     lines = [line.strip() for line in text.split('\n')]
     return '\n'.join(lines).strip()
 
@@ -77,6 +84,12 @@ def clean_text(text: str) -> str:
 def text_hash(text: str) -> str:
     """MD5-хеш текста (первые 12 символов)."""
     return hashlib.md5(text.encode('utf-8', errors='ignore')).hexdigest()[:12]
+
+
+def generate_unique_id(prefix: str = "") -> str:
+    """Генерировать уникальный ID с использованием UUID4."""
+    unique_id = uuid.uuid4().hex[:12]
+    return f"{prefix}{unique_id}" if prefix else unique_id
 
 
 def normalize_model_key(key: str) -> str:
