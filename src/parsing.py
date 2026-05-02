@@ -30,7 +30,7 @@ from PIL import Image
 from .utils import (
     clean_text, text_hash, detect_model_in_text,
     detect_model_from_filename, find_figure_caption,
-    extract_headings, estimate_tokens,
+    extract_headings, estimate_tokens, generate_unique_id,
 )
 from config import (
     OCR_DPI, OCR_MIN_TEXT_CHARS, MIN_IMAGE_WIDTH, MIN_IMAGE_HEIGHT,
@@ -106,8 +106,15 @@ def _is_scanned_page(page: fitz.Page, min_chars: int = 50) -> bool:
     return True
 
 
+# Глобальные синглтоны для OCR-движков (чтобы не загружать модели каждый раз)
+_OCR_TESSERACT_AVAILABLE = None
+_OCR_EASYOCR_READER = None
+
+
 def _ocr_image(image_pil: Image.Image, lang: str = 'rus+eng') -> str:
     """OCR изображения через Tesseract (fallback) или EasyOCR."""
+    global _OCR_TESSERACT_AVAILABLE, _OCR_EASYOCR_READER
+    
     if image_pil is None:
         return ""
 
@@ -122,12 +129,17 @@ def _ocr_image(image_pil: Image.Image, lang: str = 'rus+eng') -> str:
     except Exception as exc:
         logger.debug(f"Tesseract OCR error: {exc}")
 
-    # Попытка 2: EasyOCR
+    # Попытка 2: EasyOCR (синглтон)
     try:
         import easyocr
         import numpy as np
-        reader = easyocr.Reader(['ru', 'en'], gpu=False, verbose=False)
-        results = reader.readtext(np.array(image_pil), paragraph=True, detail=0)
+        
+        # Инициализируем Reader только один раз
+        if _OCR_EASYOCR_READER is None:
+            logger.info("Инициализация EasyOCR Reader (первый вызов)...")
+            _OCR_EASYOCR_READER = easyocr.Reader(['ru', 'en'], gpu=False, verbose=False)
+        
+        results = _OCR_EASYOCR_READER.readtext(np.array(image_pil), paragraph=True, detail=0)
         text = clean_text('\n'.join(results))
         if len(text) >= 20:
             return text
@@ -355,13 +367,43 @@ def parse_pdf(
 
             # ── Текст (исключая регионы таблиц) ──────────────────
             if page_text:
-                # Простой подход: если таблицы найдены, добавляем текст целиком,
-                # но помечаем как "text". В идеале нужно вырезать bbox таблиц,
-                # но PyMuPDF даёт это через textdict.
-                formulas = _detect_formulas_in_text(page_text)
+                # Исключаем текст из регионов таблиц, чтобы избежать дублирования
+                text_to_process = page_text
+                if table_regions:
+                    # Получаем текст с исключением bounding box таблиц
+                    try:
+                        text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+                        filtered_blocks = []
+                        for block in text_dict.get("blocks", []):
+                            if block.get("type") != 0:  # Пропускаем не текстовые блоки
+                                continue
+                            bbox = block.get("bbox", (0, 0, 0, 0))
+                            # Проверяем, пересекается ли блок с любой таблицей
+                            overlaps = False
+                            for tb in table_regions:
+                                if not (bbox[2] < tb[0] or bbox[0] > tb[2] or
+                                        bbox[3] < tb[1] or bbox[1] > tb[3]):
+                                    overlaps = True
+                                    break
+                            if not overlaps:
+                                # Собираем текст из линий блока
+                                block_text = ""
+                                for line in block.get("lines", []):
+                                    line_text = ""
+                                    for span in line.get("spans", []):
+                                        line_text += span.get("text", "")
+                                    block_text += line_text + "\n"
+                                filtered_blocks.append(block_text.strip())
+                        text_to_process = "\n\n".join(filtered_blocks)
+                    except Exception as exc:
+                        logger.debug(f"Не удалось исключить таблицы из текста: {exc}")
+                        # Fallback: используем исходный текст
+                        text_to_process = page_text
+
+                formulas = _detect_formulas_in_text(text_to_process)
 
                 # Разделяем текст на абзацы
-                paragraphs = [p.strip() for p in page_text.split('\n\n') if p.strip()]
+                paragraphs = [p.strip() for p in text_to_process.split('\n\n') if p.strip()]
                 para_idx = 0
                 for para in paragraphs:
                     if len(para) < 10:
@@ -378,9 +420,13 @@ def parse_pdf(
                     # Проверяем, содержит ли абзац формулу
                     para_formulas = _detect_formulas_in_text(para)
                     if para_formulas:
-                        # Формула — отдельный элемент; текстовый дубль не добавляем
-                        for formula_text, formula_type in para_formulas:
-                            if formula_type in ("latex_inline", "latex_block"):
+                        # Формула — отдельный элемент, НО текст вокруг сохраняем
+                        latex_formulas = [(ft, ft_type) for ft, ft_type in para_formulas 
+                                         if ft_type in ("latex_inline", "latex_block")]
+                        
+                        if latex_formulas:
+                            # Добавляем формулы как отдельные элементы
+                            for formula_text, formula_type in latex_formulas:
                                 elements.append(DocumentElement(
                                     content=formula_text,
                                     element_type="formula",
@@ -390,8 +436,19 @@ def parse_pdf(
                                     model=model,
                                     metadata={"formula_type": formula_type},
                                 ))
-                            else:
-                                # Подозреваемая формула — сохраняем как формулу с пометкой
+                            # Добавляем весь абзац как текст (включая контекст вокруг формул)
+                            elements.append(DocumentElement(
+                                content=para,
+                                element_type="text",
+                                source=pdf_path.name,
+                                page=page_num + 1,
+                                heading=current_heading,
+                                model=model,
+                            ))
+                        else:
+                            # Подозреваемая формула — сохраняем как формулу с пометкой
+                            # И также сохраняем текст для контекста
+                            for formula_text, formula_type in para_formulas:
                                 elements.append(DocumentElement(
                                     content=f"[formula] {para}",
                                     element_type="formula",
@@ -401,7 +458,16 @@ def parse_pdf(
                                     model=model,
                                     metadata={"formula_type": formula_type},
                                 ))
-                        # Не добавляем абзац повторно как text/heading
+                            # Добавляем текст без префикса [formula]
+                            elements.append(DocumentElement(
+                                content=para,
+                                element_type="text",
+                                source=pdf_path.name,
+                                page=page_num + 1,
+                                heading=current_heading,
+                                model=model,
+                            ))
+                        # Продолжаем к следующему абзацу (не добавляем дважды)
                         continue
 
                     if is_heading:

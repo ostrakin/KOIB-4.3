@@ -241,7 +241,7 @@ class IndexBuilder:
         else:
             self.embeddings = HuggingFaceEmbeddings(
                 model_name=LOCAL_EMBEDDING_MODEL,
-                encode_kwargs={"normalize_embeddings": True},
+                encode_kwargs={"normalize_embeddings": True, "truncate": True},
                 model_kwargs={"device": device},
             )
             logger.info(f"Эмбеддинги: {LOCAL_EMBEDDING_MODEL} ({device})")
@@ -267,7 +267,11 @@ class IndexBuilder:
 
         # ── 1. Текстовый FAISS-индекс ──────────────────────────
         if text_chunks:
-            texts = [PASSAGE_PREFIX + c.content for c in text_chunks]
+            # Префиксы нужны только для instruction-tuned моделей (E5, BGE), но не для OpenAI
+            if EMBEDDING_PROVIDER == "local":
+                texts = [PASSAGE_PREFIX + c.content for c in text_chunks]
+            else:
+                texts = [c.content for c in text_chunks]
             metadatas = []
             for c in text_chunks:
                 meta = dict(c.metadata)
@@ -292,7 +296,11 @@ class IndexBuilder:
                 if c.metadata.get("heading"):
                     context_prefix += f"Раздел: {c.metadata['heading']}. "
 
-                summary_texts.append(PASSAGE_PREFIX + context_prefix + c.content)
+                # Префиксы нужны только для instruction-tuned моделей (E5, BGE), но не для OpenAI
+                if EMBEDDING_PROVIDER == "local":
+                    summary_texts.append(PASSAGE_PREFIX + context_prefix + c.content)
+                else:
+                    summary_texts.append(context_prefix + c.content)
 
                 meta = dict(c.metadata)
                 meta["chunk_id"] = c.chunk_id

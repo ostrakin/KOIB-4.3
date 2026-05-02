@@ -20,7 +20,7 @@ from pathlib import Path
 from langchain_core.documents import Document
 
 from .parsing import DocumentElement
-from .utils import clean_text, text_hash, estimate_tokens, truncate_to_tokens
+from .utils import clean_text, text_hash, estimate_tokens, truncate_to_tokens, generate_unique_id
 from config import (
     TEXT_CHUNK_SIZE, TEXT_CHUNK_OVERLAP, MIN_CHUNK_LENGTH,
 )
@@ -278,7 +278,7 @@ class SmartChunker:
             if len(text) < self.min_chunk_length:
                 continue
 
-            chunk_id = text_hash(f"{source}:{page}:{i}:{text[:100]}")
+            chunk_id = generate_unique_id(prefix=f"txt_{source}_{page}_")
 
             chunks.append(Chunk(
                 chunk_id=chunk_id,
@@ -324,9 +324,7 @@ class SmartChunker:
                 except Exception:
                     pass  # Оставляем эвристическую сводку
 
-        chunk_id = text_hash(
-            f"{element.source}:{element.page}:{element.element_type}:{element.content[:200]}"
-        )
+        chunk_id = generate_unique_id(prefix=f"{element.element_type}_{element.source}_{element.page}_")
 
         return Chunk(
             chunk_id=chunk_id,
