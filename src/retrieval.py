@@ -238,13 +238,25 @@ class HybridRetriever:
         # ── 3. Объединение (Reciprocal Rank Fusion) ────────────
         fused = self._reciprocal_rank_fusion(vector_results, bm25_results)
 
-        # ── 4. Переранжирование ────────────────────────────────
+        # ── 4. Фильтрация карантина (после объединения, до переранжирования) ────────────────────────────────
+        try:
+            from .quarantine import filter_quarantined_chunks
+            fused_before_quarantine = len(fused)
+            fused = filter_quarantined_chunks(fused)
+            if len(fused) < fused_before_quarantine:
+                logger.info(
+                    f"Исключено {fused_before_quarantine - len(fused)} чанков из карантина"
+                )
+        except Exception as exc:
+            logger.warning(f"Ошибка фильтрации карантина: {exc}")
+
+        # ── 5. Переранжирование ────────────────────────────────
         if USE_RERANKER and len(fused) > k:
             reranker = self._get_reranker()
             if reranker:
                 fused = self._rerank(query, fused, reranker)
 
-        # ── 5. Фильтрация и форматирование ─────────────────────
+        # ── 6. Фильтрация и форматирование ─────────────────────
         results = fused[:k]
 
         # Подгружаем полный контент из docstore

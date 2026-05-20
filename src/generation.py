@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Koib-V-4.2 — Модуль генерации ответов
-========================================
-Генерация с жёсткой привязкой к контексту, цитированием
-и поддержкой различных LLM-провайдеров.
+Koib-V-4.2 — Модуль генерации ответов (обновлённый)
+=====================================================
+Генерация с жёсткой привязкой к контексту, цитированием,
+поддержкой различных LLM-провайдеров и пост-генерационной валидацией.
 
 Поддерживаемые провайдеры:
   - GigaChat (Сбер)
@@ -303,16 +303,59 @@ class AnswerGenerator:
     """
     Генератор ответов на основе RAG.
 
-    Пайплайн:
-      1. Поиск релевантных фрагментов (HybridRetriever)
-      2. Формирование промпта с контекстом
-      3. Генерация ответа через LLM
+    Пайплайн (обновлённый):
+      1. Поиск релевантных фрагментов (HybridRetriever) с фильтрацией карантина
+      2. Детекция чувствительных тем (safety.py)
+      3. Формирование промпта с контекстом
+      4. Генерация ответа через LLM
+      5. Пост-генерационная валидация (validation.py)
+      6. Логирование запроса (logging_module.py)
     """
 
     def __init__(self, retriever=None, llm_client: Optional[LLMClient] = None):
         from .retrieval import HybridRetriever
         self.retriever = retriever or HybridRetriever()
         self.llm = llm_client or LLMClient()
+        
+        # Инициализируем модули валидации и безопасности
+        self._validator = None
+        self._safety_detector = None
+        self._query_logger = None
+    
+    def _get_validator(self):
+        """Ленивая инициализация валидатора."""
+        if self._validator is None:
+            try:
+                from .validation import AnswerValidator
+                # Переиспользуем эмбеддинги из retriever
+                embeddings = self.retriever.index_builder.embeddings
+                self._validator = AnswerValidator(embeddings=embeddings)
+            except Exception as exc:
+                logger.warning(f"Ошибка инициализации валидатора: {exc}")
+                self._validator = None
+        return self._validator
+    
+    def _get_safety_detector(self):
+        """Ленивая инициализация детектора безопасности."""
+        if self._safety_detector is None:
+            try:
+                from .safety import get_safety_detector
+                self._safety_detector = get_safety_detector()
+            except Exception as exc:
+                logger.warning(f"Ошибка инициализации детектора безопасности: {exc}")
+                self._safety_detector = None
+        return self._safety_detector
+    
+    def _get_query_logger(self):
+        """Ленивая инициализация логгера."""
+        if self._query_logger is None:
+            try:
+                from .logging_module import get_query_logger
+                self._query_logger = get_query_logger()
+            except Exception as exc:
+                logger.warning(f"Ошибка инициализации логгера: {exc}")
+                self._query_logger = None
+        return self._query_logger
 
     def answer(
         self,
@@ -322,7 +365,7 @@ class AnswerGenerator:
         use_hyde: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
-        Полный RAG-ответ: поиск + генерация.
+        Полный RAG-ответ: поиск + генерация + валидация.
 
         Returns:
             {
@@ -330,26 +373,42 @@ class AnswerGenerator:
                 "sources": List[Dict],   # Источники с цитатами
                 "results": List[RetrievalResult],  # Найденные фрагменты
                 "context_text": str,     # Полный контекст для LLM
+                "validation": Dict,      # Результат валидации
+                "status": str,           # approved | review | rejected
             }
         """
-        # Поиск
+        # ── 1. Поиск ────────────────────────────────────────────
         results = self.retriever.search(query, k=k, model_filter=model_filter, use_hyde=use_hyde)
 
         if not results:
-            return {
+            result = {
                 "answer": "В предоставленной документации нет информации по данному вопросу.",
                 "sources": [],
                 "results": [],
                 "context_text": "",
+                "validation": {"status": "review", "reason": "no_context"},
+                "status": "review",
             }
+            # Логируем
+            self._log_query(query, result, model_filter)
+            return result
 
-        # Формирование промпта
+        # ── 2. Детекция чувствительных тем ─────────────────────
+        safety_result = None
+        safety_detector = self._get_safety_detector()
+        if safety_detector:
+            try:
+                safety_result = safety_detector.check_query(query)
+            except Exception as exc:
+                logger.warning(f"Ошибка проверки безопасности: {exc}")
+
+        # ── 3. Формирование промпта ─────────────────────────────
         context_text = build_prompt(query, results)
 
-        # Генерация
+        # ── 4. Генерация ────────────────────────────────────────
         answer = self.llm.generate(context_text)
 
-        # Извлекаем источники
+        # ── 5. Извлекаем источники ──────────────────────────────
         sources = []
         seen_sources = set()
         for r in results:
@@ -364,9 +423,77 @@ class AnswerGenerator:
                     "score": r.score,
                 })
 
-        return {
-            "answer": answer,
+        # ── 6. Пост-генерационная валидация ─────────────────────
+        validator = self._get_validator()
+        validation_result = None
+        
+        if validator:
+            try:
+                validation_result = validator.validate(
+                    answer=answer,
+                    context_chunks=results,
+                    query=query,
+                )
+            except Exception as exc:
+                logger.warning(f"Ошибка валидации ответа: {exc}")
+
+        # ── 7. Определяем итоговый статус ───────────────────────
+        status = "approved"
+        final_answer = answer
+        
+        # Проверяем валидацию
+        if validation_result:
+            if validation_result.status == "rejected":
+                # Маркеры неопределённости — блокируем ответ
+                status = "rejected"
+                final_answer = self._get_blocked_response()
+            elif validation_result.status == "review":
+                status = "review"
+        
+        # Проверяем чувствительные темы
+        if safety_result and safety_result.is_sensitive:
+            if status != "rejected":
+                status = "review"
+
+        # ── 8. Логируем запрос ──────────────────────────────────
+        result = {
+            "answer": final_answer,
             "sources": sources,
             "results": results,
             "context_text": context_text,
+            "validation": validation_result.to_dict() if validation_result else {},
+            "status": status,
+            "safety": safety_result.to_dict() if safety_result else {},
         }
+        
+        self._log_query(query, result, model_filter)
+
+        return result
+    
+    def _get_blocked_response(self) -> str:
+        """Вернуть шаблонный ответ при блокировке."""
+        try:
+            from .validation import get_blocked_response
+            return get_blocked_response()
+        except:
+            return "По вашему запросу не найдено точного ответа в официальных источниках."
+    
+    def _log_query(self, query: str, result: Dict[str, Any], model_filter: str) -> None:
+        """Записать запрос в лог."""
+        logger_instance = self._get_query_logger()
+        if logger_instance:
+            try:
+                logger_instance.log(
+                    query=query,
+                    answer=result.get("answer", ""),
+                    model_type=model_filter,
+                    sources=result.get("sources", []),
+                    validation_result=result.get("validation", {}),
+                    status=result.get("status", "unknown"),
+                    extra_metadata={
+                        "safety": result.get("safety", {}),
+                        "num_chunks": len(result.get("results", [])),
+                    },
+                )
+            except Exception as exc:
+                logger.warning(f"Ошибка логирования: {exc}")
